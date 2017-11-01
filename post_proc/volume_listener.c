@@ -18,6 +18,7 @@
 //#define LOG_NDEBUG 0
 #include <stdlib.h>
 #include <dlfcn.h>
+#include <math.h>
 
 #include <cutils/list.h>
 #include <cutils/log.h>
@@ -25,7 +26,9 @@
 #include <cutils/properties.h>
 #include <platform_api.h>
 
-#define PRIMARY_HAL_PATH XSTR(LIB_AUDIO_HAL)
+#define PRIMARY_HAL_FILENAME XSTR(LIB_AUDIO_HAL)
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+
 #define XSTR(x) STR(x)
 #define STR(x) #x
 
@@ -40,6 +43,7 @@
                                                             i == RING?"RING": \
                                                             i == ALARM?"ALARM": \
                                                             i == VOICE_CALL?"Voice_call": \
+                                                            i == VC_CALL ?"VC_call":       \
                                                             i == NOTIFICATION?"Notification":\
                                                             "--INVALID--"); \
 
@@ -69,6 +73,7 @@ enum STREAM_TYPE {
     RING,
     ALARM,
     VOICE_CALL,
+    VC_CALL,
     NOTIFICATION,
     MAX_STREAM_TYPES,
 };
@@ -199,6 +204,12 @@ struct listnode vol_effect_list;
 /* lock must be held when modifying or accessing created_effects_list */
 pthread_mutex_t vol_listner_init_lock;
 
+/* Treblized modules locations */
+static const char *primary_audio_hal_path[] =
+    {"/vendor/lib/hw/", "/system/lib/hw/"};
+
+static bool headset_cal_enabled;
+
 /*
  *  Local functions
  */
@@ -218,6 +229,7 @@ static void dump_list_l()
                 context->stream_type == RING ? "RING" :
                 context->stream_type == ALARM ? "ALARM" :
                 context->stream_type == VOICE_CALL ? "VOICE_CALL" :
+                context->stream_type == VC_CALL ? "VC_CALL" :
                 context->stream_type == NOTIFICATION ? "NOTIFICATION" : "--INVALID--",
                 context->dev_id, context->state, context->session_id, context->left_vol,context->right_vol);
     }
@@ -225,11 +237,25 @@ static void dump_list_l()
     ALOGW("DUMP_END :: ===========");
 }
 
+static inline bool valid_dev_in_context(struct vol_listener_context_s *context)
+{
+    if (context->dev_id == AUDIO_DEVICE_OUT_SPEAKER)
+        return true;
+
+    if (context->stream_type == VC_CALL && headset_cal_enabled &&
+        (context->dev_id == AUDIO_DEVICE_OUT_EARPIECE ||
+         context->dev_id == AUDIO_DEVICE_OUT_WIRED_HEADSET ||
+         context->dev_id == AUDIO_DEVICE_OUT_WIRED_HEADPHONE))
+        return true;
+
+    return false;
+}
+
 static void check_and_set_gain_dep_cal()
 {
     // iterate through list and make decision to set new gain dep cal level for speaker device
     // 1. find all usecase active on speaker
-    // 2. find average of left and right for each usecase
+    // 2. find energy sum for each usecase
     // 3. find the highest of all the active usecase
     // 4. if new value is different than the current value then load new calibration
 
@@ -243,14 +269,21 @@ static void check_and_set_gain_dep_cal()
 
     ALOGV("%s ==> Start ...", __func__);
 
-    // select the highest volume on speaker device
+    float sum_energy = 0.0;
+    bool sum_energy_used = false;
+    float temp_vol = 0;
+    // compute energy sum for the active speaker device (pick loudest of both channels)
     list_for_each(node, &vol_effect_list) {
         context = node_to_item(node, struct vol_listener_context_s, effect_list_node);
         if ((context->state == VOL_LISTENER_STATE_ACTIVE) &&
-            (context->dev_id & AUDIO_DEVICE_OUT_SPEAKER) &&
-            (new_vol < (context->left_vol + context->right_vol) / 2)) {
-            new_vol = (context->left_vol + context->right_vol) / 2;
+            valid_dev_in_context(context)) {
+            sum_energy_used = true;
+            temp_vol = fmax(context->left_vol, context->right_vol);
+            sum_energy += temp_vol * temp_vol;
         }
+    }
+    if (sum_energy_used) {
+        new_vol = fmin(sqrt(sum_energy), 1.0);
     }
 
     if (new_vol != current_vol) {
@@ -358,7 +391,9 @@ static int vol_effect_command(effect_handle_t self,
             ALOGE("%s: EFFECT_CMD_INIT: %s, sending -EINVAL", __func__,
                   (p_reply_data == NULL) ? "p_reply_data is NULL" :
                   "*reply_size != sizeof(int)");
-            return -EINVAL;
+            android_errorWriteLog(0x534e4554, "32669549");
+            status = -EINVAL;
+            goto exit;
         }
         *(int *)p_reply_data = 0;
         break;
@@ -367,7 +402,9 @@ static int vol_effect_command(effect_handle_t self,
         ALOGV("%s :: cmd called EFFECT_CMD_SET_CONFIG", __func__);
         if (p_cmd_data == NULL || cmd_size != sizeof(effect_config_t)
                 || p_reply_data == NULL || reply_size == NULL || *reply_size != sizeof(int)) {
-            return -EINVAL;
+            android_errorWriteLog(0x534e4554, "32669549");
+            status = -EINVAL;
+            goto exit;
         }
         context->config = *(effect_config_t *)p_cmd_data;
         *(int *)p_reply_data = 0;
@@ -391,7 +428,9 @@ static int vol_effect_command(effect_handle_t self,
             ALOGE("%s: EFFECT_CMD_OFFLOAD: %s, sending -EINVAL", __func__,
                   (p_reply_data == NULL) ? "p_reply_data is NULL" :
                   "*reply_size != sizeof(int)");
-            return -EINVAL;
+            android_errorWriteLog(0x534e4554, "32669549");
+            status = -EINVAL;
+            goto exit;
         }
         *(int *)p_reply_data = 0;
         break;
@@ -417,8 +456,8 @@ static int vol_effect_command(effect_handle_t self,
 
         // After changing the state and if device is speaker
         // recalculate gain dep cal level
-        if (context->dev_id == AUDIO_DEVICE_OUT_SPEAKER) {
-                check_and_set_gain_dep_cal();
+        if (valid_dev_in_context(context)) {
+            check_and_set_gain_dep_cal();
         }
 
         break;
@@ -444,7 +483,7 @@ static int vol_effect_command(effect_handle_t self,
 
         // After changing the state and if device is speaker
         // recalculate gain dep cal level
-        if (context->dev_id == AUDIO_DEVICE_OUT_SPEAKER) {
+        if (valid_dev_in_context(context)) {
             check_and_set_gain_dep_cal();
         }
 
@@ -475,8 +514,8 @@ static int vol_effect_command(effect_handle_t self,
                __func__, context->dev_id, new_device);
 
         // check if old or new device is speaker
-        if ((context->dev_id ==  AUDIO_DEVICE_OUT_SPEAKER) ||
-            (new_device == AUDIO_DEVICE_OUT_SPEAKER)) {
+        if (valid_dev_in_context(context) ||
+            new_device == AUDIO_DEVICE_OUT_SPEAKER) {
             recompute_gain_dep_cal_Level = true;
         }
 
@@ -501,7 +540,7 @@ static int vol_effect_command(effect_handle_t self,
             goto exit;
         }
 
-        if (context->dev_id == AUDIO_DEVICE_OUT_SPEAKER) {
+        if (valid_dev_in_context(context)) {
             recompute_gain_dep_cal_Level = true;
         }
 
@@ -547,9 +586,27 @@ static int vol_effect_get_descriptor(effect_handle_t   self,
     return 0;
 }
 
+static bool resolve_audio_hal_path(char *file_name, int mode) {
+    char file_path[PATH_MAX];
+    unsigned long i;
+
+    for (i = 0; i < ARRAY_SIZE(primary_audio_hal_path); i++) {
+        snprintf(file_path, PATH_MAX, "%s/%s",
+            primary_audio_hal_path[i], file_name);
+        if (F_OK == access(file_path, mode)) {
+            strcpy(file_name, file_path);
+            return true;
+        }
+    }
+    return false;
+}
+
 static void init_once()
 {
     int max_table_ent = 0;
+    void *hal_lib_pointer = NULL;
+    char primary_hal_path[PATH_MAX] = {0};
+
     if (initialized) {
         ALOGV("%s : already init .. do nothing", __func__);
         return;
@@ -561,61 +618,58 @@ static void init_once()
 
     pthread_mutex_init(&vol_listner_init_lock, NULL);
 
+    strcpy(primary_hal_path, PRIMARY_HAL_FILENAME);
     // get hal function pointer
-    if (access(PRIMARY_HAL_PATH, R_OK) == 0) {
-        void *hal_lib_pointer = dlopen(PRIMARY_HAL_PATH, RTLD_NOW);
-        if (hal_lib_pointer == NULL) {
-            ALOGE("%s: DLOPEN failed for %s", __func__, PRIMARY_HAL_PATH);
+    if (resolve_audio_hal_path(primary_hal_path, R_OK)) {
+        hal_lib_pointer = dlopen(primary_hal_path, RTLD_NOW);
+    } else {
+        ALOGE("%s: not able to acces lib: %s", __func__, PRIMARY_HAL_FILENAME);
+    }
+
+    if (!hal_lib_pointer) {
+        ALOGE("%s: DLOPEN failed for %s", __func__, primary_hal_path);
+    } else {
+        ALOGV("%s: DLOPEN of %s Succes .. next get HAL entry function", __func__, primary_hal_path);
+        send_gain_dep_cal = (bool (*)(int))dlsym(hal_lib_pointer, AHAL_GAIN_DEPENDENT_INTERFACE_FUNCTION);
+        if (send_gain_dep_cal == NULL) {
+            ALOGE("Couldnt able to get the function symbol");
+        }
+        get_custom_gain_table = (int (*) (struct amp_db_and_gain_table *, int))dlsym(hal_lib_pointer, AHAL_GAIN_GET_MAPPING_TABLE);
+        if (get_custom_gain_table == NULL) {
+            ALOGE("Couldnt able to get the function AHAL_GAIN_GET_MAPPING_TABLE  symbol");
         } else {
-            ALOGV("%s: DLOPEN of %s Succes .. next get HAL entry function", __func__, PRIMARY_HAL_PATH);
-            send_gain_dep_cal = (bool (*)(int))dlsym(hal_lib_pointer, AHAL_GAIN_DEPENDENT_INTERFACE_FUNCTION);
-            if (send_gain_dep_cal == NULL) {
-                ALOGE("Couldnt able to get the function symbol");
-            }
-            get_custom_gain_table = (int (*) (struct amp_db_and_gain_table *, int))dlsym(hal_lib_pointer, AHAL_GAIN_GET_MAPPING_TABLE);
-            if (get_custom_gain_table == NULL) {
-                ALOGE("Couldnt able to get the function AHAL_GAIN_GET_MAPPING_TABLE  symbol");
-            } else {
-                max_table_ent = get_custom_gain_table(volume_curve_gain_mapping_table, MAX_VOLUME_CAL_STEPS);
-                // if number of entries is 0 use default
-                // if number of entries > MAX_VOLUME_CAL_STEPS (this should never happen) then in this case
-                // use only default number of steps but this will result in unexpected behaviour
+            max_table_ent = get_custom_gain_table(volume_curve_gain_mapping_table, MAX_VOLUME_CAL_STEPS);
+            // if number of entries is 0 use default
+            // if number of entries > MAX_VOLUME_CAL_STEPS (this should never happen) then in this case
+            // use only default number of steps but this will result in unexpected behaviour
 
-                if (max_table_ent > 0 && max_table_ent <= MAX_VOLUME_CAL_STEPS) {
-                    if (max_table_ent < total_volume_cal_step) {
-                        for (int i = max_table_ent; i < total_volume_cal_step; i++ ) {
-                            volume_curve_gain_mapping_table[i].amp = 0;
-                            volume_curve_gain_mapping_table[i].db = 0;
-                            volume_curve_gain_mapping_table[i].level = -1;
-                        }
+            if (max_table_ent > 0 && max_table_ent <= MAX_VOLUME_CAL_STEPS) {
+                if (max_table_ent < total_volume_cal_step) {
+                    for (int i = max_table_ent; i < total_volume_cal_step; i++ ) {
+                        volume_curve_gain_mapping_table[i].amp = 0;
+                        volume_curve_gain_mapping_table[i].db = 0;
+                        volume_curve_gain_mapping_table[i].level = -1;
                     }
-                    total_volume_cal_step = max_table_ent;
-                    ALOGD("%s: using custome volume table", __func__);
-                } else {
-                    ALOGD("%s: using default volume table", __func__);
                 }
+                total_volume_cal_step = max_table_ent;
+                ALOGD("%s: using custome volume table", __func__);
+            } else {
+                ALOGD("%s: using default volume table", __func__);
+            }
 
-                if (dumping_enabled) {
-                    ALOGD("%s: dumping table here .. size of table received %d",
-                           __func__, max_table_ent);
-                    for (int i = 0; i < MAX_VOLUME_CAL_STEPS ; i++)
-                        ALOGD("[%d]  %f %f %d", i, volume_curve_gain_mapping_table[i].amp,
-                                                   volume_curve_gain_mapping_table[i].db,
-                                                   volume_curve_gain_mapping_table[i].level);
-                }
+            if (dumping_enabled) {
+                ALOGD("%s: dumping table here .. size of table received %d",
+                       __func__, max_table_ent);
+                for (int i = 0; i < MAX_VOLUME_CAL_STEPS ; i++)
+                    ALOGD("[%d]  %f %f %d", i, volume_curve_gain_mapping_table[i].amp,
+                                               volume_curve_gain_mapping_table[i].db,
+                                               volume_curve_gain_mapping_table[i].level);
             }
         }
-    } else {
-        ALOGE("%s: not able to acces lib %s ", __func__, PRIMARY_HAL_PATH);
     }
 
-    // check system property to see if dumping is required
-    char check_dump_val[PROPERTY_VALUE_MAX];
-    property_get("audio.volume.listener.dump", check_dump_val, "0");
-    if (atoi(check_dump_val)) {
-        dumping_enabled = true;
-    }
-
+    dumping_enabled = property_get_bool("audio.volume.listener.dump", false);
+    headset_cal_enabled = property_get_bool("audio.volume.headset.gain.depcal", false);
     init_status = 0;
     list_init(&vol_effect_list);
     initialized = true;
@@ -712,6 +766,14 @@ static int vol_prc_lib_release(effect_handle_t handle)
     pthread_mutex_lock(&vol_listner_init_lock);
     session_id = recv_contex->session_id;
     stream_type = recv_contex->stream_type;
+
+    if (recv_contex->desc == NULL) {
+        ALOGE("%s: Got NULL descriptor, session %u, stream type %u",
+                __func__, session_id, stream_type);
+        dump_list_l();
+        pthread_mutex_unlock(&vol_listner_init_lock);
+        return status;
+    }
     uuid = recv_contex->desc->uuid;
 
     // check if the handle/context provided is valid
@@ -723,7 +785,7 @@ static int vol_prc_lib_release(effect_handle_t handle)
             ALOGV("--- Found something to remove ---");
             list_remove(node);
             PRINT_STREAM_TYPE(context->stream_type);
-            if (context->dev_id == AUDIO_DEVICE_OUT_SPEAKER) {
+            if (valid_dev_in_context(context)) {
                 recompute_flag = true;
             }
             free(context);

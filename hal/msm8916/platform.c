@@ -31,6 +31,7 @@
 #include "audio_extn.h"
 #include "voice_extn.h"
 #include "sound/msmcal-hwdep.h"
+#include "audio_extn/tfa_98xx.h"
 #include <dirent.h>
 #define MAX_MIXER_XML_PATH  100
 #define MIXER_XML_PATH "/system/etc/mixer_paths.xml"
@@ -59,6 +60,7 @@
 /* fallback app type if the default app type from acdb loader fails */
 #define DEFAULT_APP_TYPE_RX_PATH  0x11130
 #define DEFAULT_APP_TYPE_TX_PATH  0x11132
+#define DEFAULT_RX_BACKEND "SLIMBUS_0_RX"
 
 /* Retry for delay in FW loading*/
 #define RETRY_NUMBER 20
@@ -156,7 +158,7 @@ int pcm_device_table[AUDIO_USECASE_MAX][2] = {
                                             DEEP_BUFFER_PCM_DEVICE},
     [USECASE_AUDIO_PLAYBACK_LOW_LATENCY] = {LOWLATENCY_PCM_DEVICE,
                                            LOWLATENCY_PCM_DEVICE},
-    [USECASE_AUDIO_PLAYBACK_MULTI_CH] = {MULTIMEDIA2_PCM_DEVICE,
+    [USECASE_AUDIO_PLAYBACK_HIFI] = {MULTIMEDIA2_PCM_DEVICE,
                                         MULTIMEDIA2_PCM_DEVICE},
     [USECASE_AUDIO_PLAYBACK_OFFLOAD] =
                      {PLAYBACK_OFFLOAD_DEVICE, PLAYBACK_OFFLOAD_DEVICE},
@@ -214,6 +216,9 @@ static const char * const device_table[SND_DEVICE_MAX] = {
     [SND_DEVICE_OUT_VOICE_TX] = "voice-tx",
     [SND_DEVICE_OUT_AFE_PROXY] = "afe-proxy",
     [SND_DEVICE_OUT_USB_HEADSET] = "usb-headphones",
+    [SND_DEVICE_OUT_USB_HEADPHONES] = "usb-headphones",
+    [SND_DEVICE_OUT_VOICE_USB_HEADSET] = "usb-headphones",
+    [SND_DEVICE_OUT_VOICE_USB_HEADPHONES] = "usb-headphones",
     [SND_DEVICE_OUT_SPEAKER_AND_USB_HEADSET] = "speaker-and-usb-headphones",
     [SND_DEVICE_OUT_SPEAKER_PROTECTED] = "speaker-protected",
     [SND_DEVICE_OUT_VOICE_SPEAKER_PROTECTED] = "voice-speaker-protected",
@@ -301,6 +306,9 @@ static int acdb_device_table[SND_DEVICE_MAX] = {
     [SND_DEVICE_OUT_VOICE_TX] = 45,
     [SND_DEVICE_OUT_AFE_PROXY] = 0,
     [SND_DEVICE_OUT_USB_HEADSET] = 45,
+    [SND_DEVICE_OUT_VOICE_USB_HEADSET] = 45,
+    [SND_DEVICE_OUT_VOICE_USB_HEADPHONES] = 45,
+    [SND_DEVICE_OUT_USB_HEADPHONES] = 45,
     [SND_DEVICE_OUT_SPEAKER_AND_USB_HEADSET] = 14,
     [SND_DEVICE_OUT_SPEAKER_PROTECTED] = 124,
     [SND_DEVICE_OUT_VOICE_SPEAKER_PROTECTED] = 101,
@@ -395,6 +403,9 @@ static struct name_to_index snd_device_name_index[SND_DEVICE_MAX] = {
     {TO_NAME_INDEX(SND_DEVICE_OUT_VOICE_TX)},
     {TO_NAME_INDEX(SND_DEVICE_OUT_AFE_PROXY)},
     {TO_NAME_INDEX(SND_DEVICE_OUT_USB_HEADSET)},
+    {TO_NAME_INDEX(SND_DEVICE_OUT_VOICE_USB_HEADSET)},
+    {TO_NAME_INDEX(SND_DEVICE_OUT_VOICE_USB_HEADPHONES)},
+    {TO_NAME_INDEX(SND_DEVICE_OUT_USB_HEADPHONES)},
     {TO_NAME_INDEX(SND_DEVICE_OUT_SPEAKER_AND_USB_HEADSET)},
     {TO_NAME_INDEX(SND_DEVICE_OUT_SPEAKER_PROTECTED)},
     {TO_NAME_INDEX(SND_DEVICE_OUT_VOICE_SPEAKER_PROTECTED)},
@@ -461,7 +472,7 @@ static char * hw_interface_table[SND_DEVICE_MAX] = {0};
 static struct name_to_index usecase_name_index[AUDIO_USECASE_MAX] = {
     {TO_NAME_INDEX(USECASE_AUDIO_PLAYBACK_DEEP_BUFFER)},
     {TO_NAME_INDEX(USECASE_AUDIO_PLAYBACK_LOW_LATENCY)},
-    {TO_NAME_INDEX(USECASE_AUDIO_PLAYBACK_MULTI_CH)},
+    {TO_NAME_INDEX(USECASE_AUDIO_PLAYBACK_HIFI)},
     {TO_NAME_INDEX(USECASE_AUDIO_PLAYBACK_OFFLOAD)},
     {TO_NAME_INDEX(USECASE_AUDIO_PLAYBACK_ULL)},
     {TO_NAME_INDEX(USECASE_AUDIO_RECORD)},
@@ -551,7 +562,7 @@ static char *get_current_operator()
     char mccmnc[PROPERTY_VALUE_MAX];
     char *ret = NULL;
 
-    property_get("gsm.sim.operator.numeric",mccmnc,"0");
+    property_get("gsm.sim.operator.numeric",mccmnc,"00000");
 
     list_for_each(node, &operator_info_list) {
         info_item = node_to_item(node, struct operator_info, list);
@@ -662,6 +673,9 @@ static void set_platform_defaults()
     backend_table[SND_DEVICE_IN_VOICE_RX] = strdup("afe-proxy");
     backend_table[SND_DEVICE_OUT_AFE_PROXY] = strdup("afe-proxy");
     backend_table[SND_DEVICE_OUT_USB_HEADSET] = strdup("usb-headphones");
+    backend_table[SND_DEVICE_OUT_VOICE_USB_HEADSET] = strdup("usb-headphones");
+    backend_table[SND_DEVICE_OUT_USB_HEADPHONES] = strdup("usb-headphones");
+    backend_table[SND_DEVICE_OUT_VOICE_USB_HEADPHONES] = strdup("usb-headphones");
     backend_table[SND_DEVICE_OUT_SPEAKER_AND_USB_HEADSET] =
         strdup("speaker-and-usb-headphones");
     backend_table[SND_DEVICE_IN_USB_HEADSET_MIC] = strdup("usb-headset-mic");
@@ -842,23 +856,38 @@ void *platform_init(struct audio_device *adev)
     }
 
     list_init(&operator_info_list);
+    bool card_verifed[MAX_SND_CARD] = {0};
+    const int retry_limit = property_get_int32("audio.snd_card.open.retries", RETRY_NUMBER);
 
-    while (snd_card_num < MAX_SND_CARD) {
-        adev->mixer = mixer_open(snd_card_num);
+    for (;;) {
+        if (snd_card_num >= MAX_SND_CARD) {
+            if (retry_num++ >= retry_limit) {
+                ALOGE("%s: Unable to find correct sound card, aborting.", __func__);
+                free(my_data);
+                my_data = NULL;
+                return NULL;
+            }
 
-        while (!adev->mixer && retry_num < RETRY_NUMBER) {
+            snd_card_num = 0;
             usleep(RETRY_US);
-            adev->mixer = mixer_open(snd_card_num);
-            retry_num++;
+            continue;
         }
+
+        if (card_verifed[snd_card_num]) {
+            ++snd_card_num;
+            continue;
+        }
+
+        adev->mixer = mixer_open(snd_card_num);
 
         if (!adev->mixer) {
             ALOGE("%s: Unable to open the mixer card: %d", __func__,
-                   snd_card_num);
-            retry_num = 0;
-            snd_card_num++;
+               snd_card_num);
+            ++snd_card_num;
             continue;
         }
+
+        card_verifed[snd_card_num] = true;
 
         snd_card_name = mixer_get_name(adev->mixer);
         ALOGV("%s: snd_card_name: %s", __func__, snd_card_name);
@@ -875,21 +904,21 @@ void *platform_init(struct audio_device *adev)
             if (!adev->audio_route) {
                 ALOGE("%s: Failed to init audio route controls, aborting.",
                        __func__);
+                hw_info_deinit(my_data->hw_info);
+                my_data->hw_info = NULL;
                 free(my_data);
+                my_data = NULL;
+                mixer_close(adev->mixer);
+                adev->mixer = NULL;
                 return NULL;
             }
             adev->snd_card = snd_card_num;
             ALOGD("%s: Opened sound card:%d", __func__, snd_card_num);
             break;
         }
-        retry_num = 0;
-        snd_card_num++;
-    }
-
-    if (snd_card_num >= MAX_SND_CARD) {
-        ALOGE("%s: Unable to find correct sound card, aborting.", __func__);
-        free(my_data);
-        return NULL;
+        ++snd_card_num;
+        mixer_close(adev->mixer);
+        adev->mixer = NULL;
     }
 
     //set max volume step for voice call
@@ -953,7 +982,7 @@ void *platform_init(struct audio_device *adev)
             ALOGE("%s: Could not find the symbol acdb_loader_deallocate_ACDB from %s",
                   __func__, LIB_ACDB_LOADER);
 
-        my_data->acdb_send_audio_cal_v3 = (acdb_send_audio_cal_t)dlsym(my_data->acdb_handle,
+        my_data->acdb_send_audio_cal_v3 = (acdb_send_audio_cal_v3_t)dlsym(my_data->acdb_handle,
                                                     "acdb_loader_send_audio_cal_v3");
         if (!my_data->acdb_send_audio_cal_v3)
             ALOGE("%s: Could not find the symbol acdb_send_audio_cal from %s",
@@ -1038,6 +1067,7 @@ void platform_deinit(void *platform)
         free(info_item);
     }
 
+    mixer_close(my_data->adev->mixer);
     free(platform);
 }
 
@@ -1057,7 +1087,7 @@ int platform_get_snd_device_name_extn(void *platform, snd_device_t snd_device,
 {
     struct platform_data *my_data = (struct platform_data *)platform;
 
-    if (platform == NULL || device_name == NULL) {
+    if (platform == NULL) {
         ALOGW("%s: something wrong, use legacy get_snd_device name", __func__);
         strlcpy(device_name, platform_get_snd_device_name(snd_device),
                  DEVICE_NAME_MAX_SIZE);
@@ -1077,9 +1107,16 @@ int platform_get_snd_device_name_extn(void *platform, snd_device_t snd_device,
     return 0;
 }
 
+bool platform_check_and_set_playback_backend_cfg(struct audio_device* adev __unused,
+                                              struct audio_usecase *usecase __unused,
+                                              snd_device_t snd_device __unused)
+{
+    return false;
+}
+
 bool platform_check_and_set_capture_backend_cfg(struct audio_device* adev __unused,
                                               struct audio_usecase *usecase __unused,
-                                              snd_device_t snd_device)
+                                              snd_device_t snd_device __unused)
 {
     return false;
 }
@@ -1138,6 +1175,10 @@ bool platform_check_backends_match(snd_device_t snd_device1, snd_device_t snd_de
     if (NULL != be_itf1 && NULL != be_itf2) {
         if ((NULL == strstr(be_itf2, be_itf1)) && (NULL == strstr(be_itf1, be_itf2)))
             result = false;
+    } else if (NULL != be_itf2 && (NULL == strstr(be_itf2, DEFAULT_RX_BACKEND))) {
+        result = false;
+    } else if (NULL != be_itf1 && (NULL == strstr(be_itf1, DEFAULT_RX_BACKEND))) {
+        result = false;
     }
 
     ALOGV("%s: be_itf1 = %s, be_itf2 = %s, match %d", __func__, be_itf1, be_itf2, result);
@@ -1289,13 +1330,17 @@ int platform_send_audio_calibration(void *platform, snd_device_t snd_device)
     else
         acdb_dev_type = ACDB_DEV_TYPE_IN;
 
-    if ((my_data->acdb_send_audio_cal_v3) && (snd_device == SND_DEVICE_IN_VOICE_SPEAKER_MIC_HFP)) {
+    if ((my_data->acdb_send_audio_cal_v3) &&
+        (snd_device == SND_DEVICE_IN_VOICE_SPEAKER_MIC_HFP) &&
+        !audio_extn_tfa_98xx_is_supported() ) {
             /* TX path calibration */
             my_data->acdb_send_audio_cal_v3(acdb_dev_id, ACDB_DEV_TYPE_IN,
                                 DEFAULT_APP_TYPE_TX_PATH, sample_rate, BUFF_IDX_0);
             my_data->acdb_send_audio_cal_v3(acdb_dev_id, ACDB_DEV_TYPE_OUT,
                                 DEFAULT_APP_TYPE_RX_PATH, sample_rate, BUFF_IDX_0);
-    } else if ((my_data->acdb_send_audio_cal_v3) && (snd_device == SND_DEVICE_OUT_VOICE_SPEAKER_HFP)) {
+    } else if ((my_data->acdb_send_audio_cal_v3) &&
+               (snd_device == SND_DEVICE_OUT_VOICE_SPEAKER_HFP) &&
+               !audio_extn_tfa_98xx_is_supported()) {
             /* RX path calibration */
             ALOGV("%s: sending audio calibration for snd_device(%d) acdb_id(%d)",
                        __func__, snd_device, acdb_dev_id);
@@ -1413,7 +1458,9 @@ int platform_set_mic_mute(void *platform, bool state)
     struct mixer_ctl *ctl;
     const char *mixer_ctl_name = "Voice Tx Mute";
     int ret = 0;
-    uint32_t set_values[ ] = {0};
+    uint32_t set_values[ ] = {0,
+                              ALL_SESSION_VSID,
+                              DEFAULT_MUTE_RAMP_DURATION_MS};
 
     if (audio_extn_hfp_is_active(adev))
         mixer_ctl_name = "HFP TX Mute";
@@ -1426,7 +1473,11 @@ int platform_set_mic_mute(void *platform, bool state)
         return -EINVAL;
     }
     ALOGV("Setting voice mute state: %d", state);
-    ret = mixer_ctl_set_array(ctl, set_values, ARRAY_SIZE(set_values));
+    // "HFP TX mute" mixer control has xcount of 1.
+    if (audio_extn_hfp_is_active(adev))
+        ret = mixer_ctl_set_array(ctl, set_values, 1 /*count*/);
+    else
+        ret = mixer_ctl_set_array(ctl, set_values, ARRAY_SIZE(set_values));
     return ret;
 }
 
@@ -2212,46 +2263,93 @@ int ramp_speaker_gain(struct audio_device *adev, bool ramp_up, int target_ramp_u
     return start_gain;
 }
 
-int platform_swap_lr_channels(struct audio_device *adev, bool swap_channels)
+int platform_set_swap_mixer(struct audio_device *adev, bool swap_channels)
+{
+    const char *mixer_ctl_name = "Swap channel";
+    struct mixer_ctl *ctl;
+    const char *mixer_path;
+    struct platform_data *my_data = (struct platform_data *)adev->platform;
+
+    // forced to set to swap, but device not rotated ... ignore set
+    if (swap_channels && !my_data->speaker_lr_swap)
+        return 0;
+
+    ALOGV("%s:", __func__);
+
+    if (swap_channels) {
+        mixer_path = platform_get_snd_device_name(SND_DEVICE_OUT_SPEAKER_REVERSE);
+        audio_route_apply_and_update_path(adev->audio_route, mixer_path);
+    } else {
+        mixer_path = platform_get_snd_device_name(SND_DEVICE_OUT_SPEAKER);
+        audio_route_apply_and_update_path(adev->audio_route, mixer_path);
+    }
+
+    ctl = mixer_get_ctl_by_name(adev->mixer, mixer_ctl_name);
+    if (!ctl) {
+        ALOGE("%s: Could not get ctl for mixer cmd - %s",__func__, mixer_ctl_name);
+        return -EINVAL;
+    }
+
+    if (mixer_ctl_set_value(ctl, 0, swap_channels) < 0) {
+        ALOGE("%s: Could not set reverse cotrol %d",__func__, swap_channels);
+        return -EINVAL;
+    }
+
+    ALOGV("platfor_force_swap_channel :: Channel orientation ( %s ) ",
+           swap_channels?"R --> L":"L --> R");
+
+    return 0;
+}
+
+int platform_check_and_set_swap_lr_channels(struct audio_device *adev, bool swap_channels)
 {
     // only update if there is active pcm playback on speaker
     struct audio_usecase *usecase;
     struct listnode *node;
     struct platform_data *my_data = (struct platform_data *)adev->platform;
 
-    if (my_data->speaker_lr_swap != swap_channels) {
-        my_data->speaker_lr_swap = swap_channels;
+    my_data->speaker_lr_swap = swap_channels;
 
-        list_for_each(node, &adev->usecase_list) {
-            usecase = node_to_item(node, struct audio_usecase, list);
-            if (usecase->type == PCM_PLAYBACK &&
-                    usecase->stream.out->devices & AUDIO_DEVICE_OUT_SPEAKER) {
-                /*
-                 * If acdb tuning is different for SPEAKER_REVERSE, it is must
-                 * to perform device switch to disable the current backend to
-                 * enable it with new acdb data.
-                 */
-                if (acdb_device_table[SND_DEVICE_OUT_SPEAKER] !=
-                    acdb_device_table[SND_DEVICE_OUT_SPEAKER_REVERSE]) {
-                    const int initial_skpr_gain = ramp_speaker_gain(adev, false /*ramp_up*/, -1);
-                    select_devices(adev, usecase->id);
-                    if (initial_skpr_gain != -EINVAL) {
-                        ramp_speaker_gain(adev, true /*ramp_up*/, initial_skpr_gain);
-                    }
-                } else {
-                    const char *mixer_path;
-                    if (swap_channels) {
-                        mixer_path = platform_get_snd_device_name(SND_DEVICE_OUT_SPEAKER_REVERSE);
-                        audio_route_apply_and_update_path(adev->audio_route, mixer_path);
-                    } else {
-                        mixer_path = platform_get_snd_device_name(SND_DEVICE_OUT_SPEAKER);
-                        audio_route_apply_and_update_path(adev->audio_route, mixer_path);
-                    }
-                }
-                break;
+    return platform_set_swap_channels(adev, swap_channels);
+}
+
+int platform_set_swap_channels(struct audio_device *adev, bool swap_channels)
+{
+    // only update if there is active pcm playback on speaker
+    struct audio_usecase *usecase;
+    struct listnode *node;
+    struct platform_data *my_data = (struct platform_data *)adev->platform;
+
+    // do not swap channels in audio modes with concurrent capture and playback
+    // as this may break the echo reference
+    if ((adev->mode == AUDIO_MODE_IN_COMMUNICATION) || (adev->mode == AUDIO_MODE_IN_CALL)) {
+        ALOGV("%s: will not swap due to audio mode %d", __func__, adev->mode);
+        return 0;
+    }
+
+    list_for_each(node, &adev->usecase_list) {
+        usecase = node_to_item(node, struct audio_usecase, list);
+        if (usecase->type == PCM_PLAYBACK &&
+                usecase->stream.out->devices & AUDIO_DEVICE_OUT_SPEAKER) {
+            /*
+             * If acdb tuning is different for SPEAKER_REVERSE, it is must
+             * to perform device switch to disable the current backend to
+             * enable it with new acdb data.
+             */
+            if (acdb_device_table[SND_DEVICE_OUT_SPEAKER] !=
+                acdb_device_table[SND_DEVICE_OUT_SPEAKER_REVERSE]) {
+                const int initial_skpr_gain = ramp_speaker_gain(adev, false /*ramp_up*/, -1);
+                select_devices(adev, usecase->id);
+                if (initial_skpr_gain != -EINVAL)
+                    ramp_speaker_gain(adev, true /*ramp_up*/, initial_skpr_gain);
+
+            } else {
+                platform_set_swap_mixer(adev, swap_channels);
             }
+            break;
         }
     }
+
     return 0;
 }
 
@@ -2259,4 +2357,69 @@ int platform_snd_card_update(void *platform __unused,
                              card_status_t status __unused)
 {
     return -1;
+}
+
+int platform_send_audio_calibration_v2(void *platform __unused,
+                                       struct audio_usecase *usecase __unused,
+                                       int app_type __unused,
+                                       int sample_rate __unused)
+{
+    return -ENOSYS;
+}
+
+void platform_check_and_update_copp_sample_rate(void* platform __unused,
+                                               snd_device_t snd_device __unused,
+                                                unsigned int stream_sr __unused,
+                                                int* sample_rate __unused)
+{
+
+}
+
+int platform_get_snd_device_backend_index(snd_device_t snd_device __unused)
+{
+    return -ENOSYS;
+}
+
+bool platform_supports_app_type_cfg() { return false; }
+
+void platform_add_app_type(const char *uc_type __unused,
+                           const char *mode __unused,
+                           int bw __unused, int app_type __unused,
+                           int max_sr __unused) {}
+
+int platform_get_app_type_v2(void *platform __unused,
+                             enum usecase_type_t type __unused,
+                             const char *mode __unused,
+                             int bw __unused, int sr __unused,
+                             int *app_type __unused) {
+    return -ENOSYS;
+}
+
+int platform_set_sidetone(struct audio_device *adev,
+                          snd_device_t out_snd_device,
+                          bool enable, char *str)
+{
+    int ret;
+    if (out_snd_device == SND_DEVICE_OUT_USB_HEADSET ||
+        out_snd_device == SND_DEVICE_OUT_VOICE_USB_HEADSET) {
+            ret = audio_extn_usb_enable_sidetone(out_snd_device, enable);
+            if (ret)
+                ALOGI("%s: usb device %d does not support device sidetone\n",
+                  __func__, out_snd_device);
+    } else {
+        ALOGV("%s: sidetone out device(%d) mixer cmd = %s\n",
+              __func__, out_snd_device, str);
+
+        if (enable)
+            audio_route_apply_and_update_path(adev->audio_route, str);
+        else
+            audio_route_reset_and_update_path(adev->audio_route, str);
+    }
+    return 0;
+}
+
+int platform_get_mmap_data_fd(void *platform __unused, int fe_dev __unused, int dir __unused,
+                              int *fd __unused, uint32_t *size __unused)
+{
+    return -ENOSYS;
 }

@@ -29,6 +29,7 @@
 #include "voice_extn/voice_extn.h"
 #include "platform.h"
 #include "platform_api.h"
+#include "audio_extn/tfa_98xx.h"
 
 struct pcm_config pcm_config_voice_call = {
     .channels = 1,
@@ -67,7 +68,13 @@ static bool voice_is_sidetone_device(snd_device_t out_device,
     case SND_DEVICE_OUT_VOICE_HEADPHONES:
         strlcpy(mixer_path, "sidetone-headphones", MIXER_PATH_MAX_LENGTH);
         break;
+    case SND_DEVICE_OUT_VOICE_USB_HEADSET:
+    case SND_DEVICE_OUT_USB_HEADSET:
+        // USB does not use a QC mixer.
+        mixer_path[0] = '\0';
+        break;
     default:
+        ALOGW("%s: %d is not a sidetone device", __func__, out_device);
         is_sidetone_dev = false;
         break;
     }
@@ -85,21 +92,8 @@ void voice_set_sidetone(struct audio_device *adev,
           __func__, (enable ? "enable" : "disable"),
           out_snd_device);
 
-    is_sidetone_dev = voice_is_sidetone_device(out_snd_device, mixer_path);
-
-    if (!is_sidetone_dev) {
-        ALOGD("%s: device %d does not support sidetone\n",
-              __func__, out_snd_device);
-        return;
-    }
-
-    ALOGD("%s: sidetone out device = %s\n",
-          __func__, mixer_path);
-
-    if (enable)
-        audio_route_apply_and_update_path(adev->audio_route, mixer_path);
-    else
-        audio_route_reset_and_update_path(adev->audio_route, mixer_path);
+    if (voice_is_sidetone_device(out_snd_device, mixer_path))
+        platform_set_sidetone(adev, out_snd_device, enable, mixer_path);
 
     return;
 }
@@ -145,6 +139,11 @@ int voice_stop_usecase(struct audio_device *adev, audio_usecase_t usecase_id)
     /* 3. Disable the rx and tx devices */
     disable_snd_device(adev, uc_info->out_snd_device);
     disable_snd_device(adev, uc_info->in_snd_device);
+
+    if (audio_extn_tfa_98xx_is_supported() && voice_get_mic_mute(adev)) {
+        voice_set_mic_mute(adev, false);
+        ALOGD("%s: unMute voice Tx", __func__);
+    }
 
     list_remove(&uc_info->list);
     free(uc_info);
@@ -210,6 +209,8 @@ int voice_start_usecase(struct audio_device *adev, audio_usecase_t usecase_id)
 
     pcm_start(session->pcm_tx);
     pcm_start(session->pcm_rx);
+
+    audio_extn_tfa_98xx_enable_speaker();
 
     /* Enable sidetone only when no calls are already active */
     if (!voice_is_call_state_active(adev))
@@ -531,6 +532,7 @@ void voice_update_devices_for_all_voice_usecases(struct audio_device *adev)
                   use_case_table[usecase->id]);
             usecase->stream.out = adev->current_call_output;
             select_devices(adev, usecase->id);
+            audio_extn_tfa_98xx_update();
         }
     }
 }
