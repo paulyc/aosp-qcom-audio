@@ -25,15 +25,17 @@
 #include <tinycompress/tinycompress.h>
 
 #include <audio_route/audio_route.h>
+#include <audio_utils/ErrorLog.h>
+#include <audio_utils/PowerLog.h>
 #include "voice.h"
 
 // dlopen() does not go through default library path search if there is a "/" in the library name.
 #ifdef __LP64__
-#define VISUALIZER_LIBRARY_PATH "/system/lib64/soundfx/libqcomvisualizer.so"
-#define OFFLOAD_EFFECTS_BUNDLE_LIBRARY_PATH "/system/lib64/soundfx/libqcompostprocbundle.so"
+#define VISUALIZER_LIBRARY_PATH "/vendor/lib64/soundfx/libqcomvisualizer.so"
+#define OFFLOAD_EFFECTS_BUNDLE_LIBRARY_PATH "/vendor/lib64/soundfx/libqcompostprocbundle.so"
 #else
-#define VISUALIZER_LIBRARY_PATH "/system/lib/soundfx/libqcomvisualizer.so"
-#define OFFLOAD_EFFECTS_BUNDLE_LIBRARY_PATH "/system/lib/soundfx/libqcompostprocbundle.so"
+#define VISUALIZER_LIBRARY_PATH "/vendor/lib/soundfx/libqcomvisualizer.so"
+#define OFFLOAD_EFFECTS_BUNDLE_LIBRARY_PATH "/vendor/lib/soundfx/libqcompostprocbundle.so"
 #endif
 #define ADM_LIBRARY_PATH "libadm.so"
 
@@ -48,10 +50,23 @@
 #define ACDB_DEV_TYPE_OUT 1
 #define ACDB_DEV_TYPE_IN 2
 
-#define MAX_SUPPORTED_CHANNEL_MASKS 2
+#define MAX_SUPPORTED_CHANNEL_MASKS 8
+#define MAX_SUPPORTED_FORMATS 15
+#define MAX_SUPPORTED_SAMPLE_RATES 7
 #define DEFAULT_HDMI_OUT_CHANNELS   2
 
 #define ERROR_LOG_ENTRIES 16
+
+#define POWER_LOG_LINES 40
+#define POWER_LOG_SAMPLING_INTERVAL_MS 50
+#define POWER_LOG_ENTRIES (1 /* minutes */ * 60 /* seconds */ * 1000 /* msec */ \
+                           / POWER_LOG_SAMPLING_INTERVAL_MS)
+
+/* Error types for the error log */
+enum {
+    ERROR_CODE_STANDBY = 1,
+    ERROR_CODE_WRITE,
+};
 
 typedef enum card_status_t {
     CARD_STATUS_OFFLINE,
@@ -67,10 +82,11 @@ enum {
     /* Playback usecases */
     USECASE_AUDIO_PLAYBACK_DEEP_BUFFER = 0,
     USECASE_AUDIO_PLAYBACK_LOW_LATENCY,
-    USECASE_AUDIO_PLAYBACK_MULTI_CH,
+    USECASE_AUDIO_PLAYBACK_HIFI,
     USECASE_AUDIO_PLAYBACK_OFFLOAD,
     USECASE_AUDIO_PLAYBACK_TTS,
     USECASE_AUDIO_PLAYBACK_ULL,
+    USECASE_AUDIO_PLAYBACK_MMAP,
 
     /* HFP Use case*/
     USECASE_AUDIO_HFP_SCO,
@@ -79,6 +95,8 @@ enum {
     /* Capture usecases */
     USECASE_AUDIO_RECORD,
     USECASE_AUDIO_RECORD_LOW_LATENCY,
+    USECASE_AUDIO_RECORD_MMAP,
+    USECASE_AUDIO_RECORD_HIFI,
 
     /* Voice extension usecases
      *
@@ -113,6 +131,10 @@ enum {
     USECASE_AUDIO_PLAYBACK_AFE_PROXY,
     USECASE_AUDIO_RECORD_AFE_PROXY,
     USECASE_AUDIO_DSM_FEEDBACK,
+
+    /* VOIP usecase*/
+    USECASE_AUDIO_PLAYBACK_VOIP,
+    USECASE_AUDIO_RECORD_VOIP,
 
     AUDIO_USECASE_MAX
 };
@@ -150,22 +172,12 @@ struct offload_cmd {
     int data[];
 };
 
-enum {
-    ERROR_CODE_STANDBY,
-    ERROR_CODE_WRITE,
-};
-
-struct error_log_entry {
-    int32_t code;
-    int32_t count;
-    int64_t first_time;
-    int64_t last_time;
-};
-
-struct error_log {
-    uint32_t errors;
-    uint32_t idx;
-    struct error_log_entry entries[ERROR_LOG_ENTRIES];
+struct stream_app_type_cfg {
+    int sample_rate;
+    uint32_t bit_width; // unused
+    const char *mode;
+    int app_type;
+    int gain[2];
 };
 
 struct stream_out {
@@ -187,6 +199,8 @@ struct stream_out {
     audio_usecase_t usecase;
     /* Array of supported channel mask configurations. +1 so that the last entry is always 0 */
     audio_channel_mask_t supported_channel_masks[MAX_SUPPORTED_CHANNEL_MASKS + 1];
+    audio_format_t supported_formats[MAX_SUPPORTED_FORMATS + 1];
+    uint32_t supported_sample_rates[MAX_SUPPORTED_SAMPLE_RATES + 1];
     bool muted;
     uint64_t written; /* total frames written, not cleared when entering standby */
     audio_io_handle_t handle;
@@ -205,11 +219,13 @@ struct stream_out {
     int send_new_metadata;
     bool realtime;
     int af_period_multiplier;
-    bool routing_change;
     struct audio_device *dev;
     card_status_t card_status;
 
-    struct error_log error_log;
+    error_log_t *error_log;
+    power_log_t *power_log;
+
+    struct stream_app_type_cfg app_type_cfg;
 };
 
 struct stream_in {
@@ -223,6 +239,7 @@ struct stream_in {
     int pcm_device_id;
     audio_devices_t device;
     audio_channel_mask_t channel_mask;
+    unsigned int sample_rate;
     audio_usecase_t usecase;
     bool enable_aec;
     bool enable_ns;
@@ -234,17 +251,26 @@ struct stream_in {
     bool is_st_session_active;
     bool realtime;
     int af_period_multiplier;
-    bool routing_change;
     struct audio_device *dev;
     audio_format_t format;
     card_status_t card_status;
+    int capture_started;
+
+    struct stream_app_type_cfg app_type_cfg;
+
+    /* Array of supported channel mask configurations.
+       +1 so that the last entry is always 0 */
+    audio_channel_mask_t supported_channel_masks[MAX_SUPPORTED_CHANNEL_MASKS + 1];
+    audio_format_t supported_formats[MAX_SUPPORTED_FORMATS + 1];
+    uint32_t supported_sample_rates[MAX_SUPPORTED_SAMPLE_RATES + 1];
 };
 
 typedef enum usecase_type_t {
     PCM_PLAYBACK,
     PCM_CAPTURE,
     VOICE_CALL,
-    PCM_HFP_CALL
+    PCM_HFP_CALL,
+    USECASE_TYPE_MAX
 } usecase_type_t;
 
 union stream_ptr {
