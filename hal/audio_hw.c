@@ -443,6 +443,12 @@ static int parse_snd_card_status(struct str_parms * parms, int * card,
     return 0;
 }
 
+// always call with adev lock held
+void send_gain_dep_calibration_l() {
+    if (last_known_cal_step >= 0)
+        platform_send_gain_dep_cal(adev->platform, last_known_cal_step);
+}
+
 __attribute__ ((visibility ("default")))
 bool audio_hw_send_gain_dep_calibration(int level) {
     bool ret_val = false;
@@ -452,15 +458,9 @@ bool audio_hw_send_gain_dep_calibration(int level) {
 
     if (adev != NULL && adev->platform != NULL) {
         pthread_mutex_lock(&adev->lock);
-        ret_val = platform_send_gain_dep_cal(adev->platform, level);
+        last_known_cal_step = level;
+        send_gain_dep_calibration_l();
         pthread_mutex_unlock(&adev->lock);
-
-        // if cal set fails, cache level info
-        // if cal set succeds, reset known last cal set
-        if (!ret_val)
-            last_known_cal_step = level;
-        else if (last_known_cal_step != -1)
-            last_known_cal_step = -1;
     } else {
         ALOGE("%s: %s is NULL", __func__, adev == NULL ? "adev" : "adev->platform");
     }
@@ -687,9 +687,12 @@ int disable_snd_device(struct audio_device *adev,
             audio_extn_spkr_prot_is_enabled()) {
             audio_extn_spkr_prot_stop_processing(snd_device);
 
+            // FIXME b/65363602: bullhead is the only Nexus with audio_extn_spkr_prot_is_enabled()
+            // and does not use speaker swap. As this code causes a problem with device enable ref
+            // counting we remove it for now.
             // when speaker device is disabled, reset swap.
             // will be renabled on usecase start
-            platform_set_swap_channels(adev, false);
+            // platform_set_swap_channels(adev, false);
 
         } else if (platform_can_split_snd_device(snd_device,
                                                  &num_devices,
@@ -1164,6 +1167,8 @@ int select_devices(struct audio_device *adev,
     audio_usecase_t hfp_ucid;
     struct listnode *node;
     int status = 0;
+    struct audio_usecase *voip_usecase = get_usecase_from_list(adev,
+                                             USECASE_AUDIO_PLAYBACK_VOIP);
 
     usecase = get_usecase_from_list(adev, uc_id);
     if (usecase == NULL) {
@@ -1207,8 +1212,6 @@ int select_devices(struct audio_device *adev,
             in_snd_device = SND_DEVICE_NONE;
             if (out_snd_device == SND_DEVICE_NONE) {
                 struct stream_out *voip_out = adev->primary_output;
-                struct audio_usecase *voip_usecase = get_usecase_from_list(adev,
-                                                         USECASE_AUDIO_PLAYBACK_VOIP);
 
                 out_snd_device = platform_get_output_snd_device(adev->platform,
                                             usecase->stream.out->devices);
@@ -1360,6 +1363,12 @@ int select_devices(struct audio_device *adev,
             voice_set_sidetone(adev, out_snd_device, true);
     }
 
+    if (usecase == voip_usecase) {
+        struct stream_out *voip_out = voip_usecase->stream.out;
+        audio_extn_utils_send_app_type_gain(adev,
+                                            voip_out->app_type_cfg.app_type,
+                                            &voip_out->app_type_cfg.gain[0]);
+    }
     return status;
 }
 
@@ -1946,9 +1955,6 @@ int start_output_stream(struct stream_out *out)
     register_out_stream(out);
     audio_extn_perf_lock_release();
     audio_extn_tfa_98xx_enable_speaker();
-    audio_extn_utils_send_app_type_gain(out->dev,
-                                        out->app_type_cfg.app_type,
-                                        &out->app_type_cfg.gain[0]);
 
     // consider a scenario where on pause lower layers are tear down.
     // so on resume, swap mixer control need to be sent only when
@@ -2613,17 +2619,19 @@ static ssize_t out_write(struct audio_stream_out *stream, const void *buffer,
         out->standby = false;
         pthread_mutex_lock(&adev->lock);
         ret = start_output_stream(out);
-        pthread_mutex_unlock(&adev->lock);
+
         /* ToDo: If use case is compress offload should return 0 */
         if (ret != 0) {
             out->standby = true;
+            pthread_mutex_unlock(&adev->lock);
             goto exit;
         }
 
-        if (last_known_cal_step != -1) {
-            ALOGD("%s: retry previous failed cal level set", __func__);
-            audio_hw_send_gain_dep_calibration(last_known_cal_step);
-        }
+        // after standby always force set last known cal step
+        // dont change level anywhere except at the audio_hw_send_gain_dep_calibration
+        ALOGD("%s: retry previous failed cal level set", __func__);
+        send_gain_dep_calibration_l();
+        pthread_mutex_unlock(&adev->lock);
     }
 
     if (out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD) {
@@ -2670,20 +2678,35 @@ static ssize_t out_write(struct audio_stream_out *stream, const void *buffer,
     } else {
         error_code = ERROR_CODE_WRITE;
         if (out->pcm) {
+            size_t bytes_to_write = bytes;
+
             if (out->muted)
                 memset((void *)buffer, 0, bytes);
+            // FIXME: this can be removed once audio flinger mixer supports mono output
+            if (out->usecase == USECASE_AUDIO_PLAYBACK_VOIP) {
+                size_t channel_count = audio_channel_count_from_out_mask(out->channel_mask);
+                int16_t *src = (int16_t *)buffer;
+                int16_t *dst = (int16_t *)buffer;
 
-            ALOGVV("%s: writing buffer (%zu bytes) to pcm device", __func__, bytes);
+                LOG_ALWAYS_FATAL_IF(out->config.channels != 1 || channel_count != 2 ||
+                                    out->format != AUDIO_FORMAT_PCM_16_BIT,
+                                    "out_write called for VOIP use case with wrong properties");
 
-            long ns = pcm_bytes_to_frames(out->pcm, bytes)*1000000000LL/
-                                                out->config.rate;
+                for (size_t i = 0; i < frames ; i++, dst++, src += 2) {
+                    *dst = (int16_t)(((int32_t)src[0] + (int32_t)src[1]) >> 1);
+                }
+                bytes_to_write /= 2;
+            }
+            ALOGVV("%s: writing buffer (%zu bytes) to pcm device", __func__, bytes_to_write);
+
+            long ns = (frames * NANOS_PER_SECOND) / out->config.rate;
             request_out_focus(out, ns);
 
             bool use_mmap = is_mmap_usecase(out->usecase) || out->realtime;
             if (use_mmap)
-                ret = pcm_mmap_write(out->pcm, (void *)buffer, bytes);
+                ret = pcm_mmap_write(out->pcm, (void *)buffer, bytes_to_write);
             else
-                ret = pcm_write(out->pcm, (void *)buffer, bytes);
+                ret = pcm_write(out->pcm, (void *)buffer, bytes_to_write);
 
             release_out_focus(out, ns);
         } else {
@@ -3451,10 +3474,8 @@ static int add_remove_audio_effect(const struct audio_stream *stream,
             struct listnode *node;
             list_for_each(node, &adev->usecase_list) {
                 usecase = node_to_item(node, struct audio_usecase, list);
-                if (usecase->type == PCM_PLAYBACK) {
+                if (usecase->type == PCM_PLAYBACK)
                     select_devices(adev, usecase->id);
-                    break;
-                }
             }
         }
         if (!in->standby)
@@ -3803,17 +3824,13 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
         out->usecase = USECASE_AUDIO_PLAYBACK_AFE_PROXY;
         out->config = pcm_config_afe_proxy_playback;
         adev->voice_tx_output = out;
-    } else if (out->flags == (AUDIO_OUTPUT_FLAG_DIRECT |
-                              AUDIO_OUTPUT_FLAG_VOIP_RX)) {
+    } else if (out->flags == AUDIO_OUTPUT_FLAG_VOIP_RX) {
+        //FIXME: add support for MONO stream configuration when audioflinger mixer supports it
         uint32_t buffer_size, frame_size;
-        out->supported_channel_masks[0] = AUDIO_CHANNEL_OUT_MONO;
-        out->channel_mask = AUDIO_CHANNEL_OUT_MONO;
         out->usecase = USECASE_AUDIO_PLAYBACK_VOIP;
         out->config = pcm_config_voip;
         out->config.format = pcm_format_from_audio_format(config->format);
         out->config.rate = config->sample_rate;
-        out->config.channels =
-                audio_channel_count_from_out_mask(config->channel_mask);
         buffer_size = get_stream_buffer_size(VOIP_PLAYBACK_PERIOD_DURATION_MSEC,
                                              config->sample_rate,
                                              config->format,
