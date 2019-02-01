@@ -103,6 +103,7 @@ LOCAL_SHARED_LIBRARIES := \
 	libaudioutils \
 	liblog \
 	libcutils \
+	libprocessgroup \
 	libtinyalsa \
 	libtinycompress \
 	libaudioroute \
@@ -198,6 +199,10 @@ endif
 ifeq ($(strip $(AUDIO_FEATURE_ENABLED_MAXX_AUDIO)), true)
     LOCAL_CFLAGS += -DMAXXAUDIO_QDSP_ENABLED
     LOCAL_SRC_FILES += audio_extn/maxxaudio.c
+endif
+
+ifeq ($(strip $(AUDIO_FEATURE_ENABLED_24BITS_CAMCORDER)), true)
+    LOCAL_CFLAGS += -DENABLED_24BITS_CAMCORDER
 endif
 
 ifeq ($(strip $(AUDIO_FEATURE_ENABLED_BG_CAL)),true)
